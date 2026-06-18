@@ -1,0 +1,10 @@
+services:
+  rotation-go:
+    build: .
+    network_mode: host
+    env_file:
+      - ../debtster_import/.env
+    environment:
+      - ADDR=:8040
+      - SERVICE_TOKEN=${SERVICE_TOKEN:-debtster-rotation}
+    restart: unless-stopped
