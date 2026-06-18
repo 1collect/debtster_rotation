@@ -3,7 +3,7 @@ services:
     build: .
     network_mode: host
     env_file:
-      - ../debtster_import/.env
+      - .env
     environment:
       - ADDR=:8040
       - SERVICE_TOKEN=${SERVICE_TOKEN:-debtster-rotation}
