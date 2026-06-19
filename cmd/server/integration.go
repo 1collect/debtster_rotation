@@ -60,6 +60,8 @@ type rotationRecordDoc struct {
 func initIntegrations(ctx context.Context) *appIntegrations {
 	integrations := &appIntegrations{}
 
+	logStartupEnvCheck()
+
 	if pg, err := newPostgresPool(ctx); err != nil {
 		log.Printf("postgres disabled: %v", err)
 	} else {
@@ -80,6 +82,88 @@ func initIntegrations(ctx context.Context) *appIntegrations {
 	}
 
 	return integrations
+}
+
+type envCheck struct {
+	name     string
+	aliases  []string
+	fallback string
+	secret   bool
+	host     bool
+}
+
+func logStartupEnvCheck() {
+	checks := []envCheck{
+		{name: "ADDR", fallback: ":8040"},
+		{name: "SERVICE_TOKEN", fallback: "debtster-rotation", secret: true},
+		{name: "PG_HOST", aliases: []string{"DB_HOST"}, fallback: "127.0.0.1", host: true},
+		{name: "PG_PORT", aliases: []string{"DB_PORT"}, fallback: "5432"},
+		{name: "PG_USER", aliases: []string{"DB_USERNAME"}, fallback: "root"},
+		{name: "PG_PASSWORD", aliases: []string{"DB_PASSWORD"}, fallback: "hello-world", secret: true},
+		{name: "PG_DB", aliases: []string{"DB_DATABASE"}, fallback: "debtster"},
+		{name: "PG_SSLMODE", fallback: "disable"},
+		{name: "MONGO_SCHEME", fallback: "mongodb"},
+		{name: "MONGO_HOST", aliases: []string{"DB_IMPORT_HOST"}, fallback: "127.0.0.1", host: true},
+		{name: "MONGO_PORT", aliases: []string{"DB_IMPORT_PORT"}, fallback: "27017"},
+		{name: "MONGO_USER", aliases: []string{"DB_IMPORT_USERNAME"}},
+		{name: "MONGO_PASSWORD", aliases: []string{"DB_IMPORT_PASSWORD"}, secret: true},
+		{name: "MONGO_DB", aliases: []string{"DB_IMPORT_DATABASE"}, fallback: "pkb_imports"},
+		{name: "MONGO_AUTH_SOURCE"},
+		{name: "AWS_ENDPOINT", fallback: "127.0.0.1:3304", host: true},
+		{name: "AWS_USE_SSL", fallback: "false"},
+		{name: "AWS_BUCKET", fallback: "debtster"},
+		{name: "AWS_ACCESS_KEY_ID", fallback: "minioadmin"},
+		{name: "AWS_SECRET_ACCESS_KEY", fallback: "minioadmin", secret: true},
+		{name: "AWS_DEFAULT_REGION", fallback: "us-east-1"},
+	}
+
+	for _, check := range checks {
+		value, source, explicit := resolveEnv(check.name, check.aliases, check.fallback)
+		display := value
+		if check.secret {
+			display = maskSecret(value)
+		}
+		if !explicit {
+			log.Printf("env check key=%s source=default value=%q", check.name, display)
+		} else {
+			log.Printf("env check key=%s source=%s value=%q", check.name, source, display)
+		}
+		if check.host && isLoopbackEndpoint(value) {
+			log.Printf("env warning key=%s value=%q uses loopback address; inside Docker bridge network this points to the rotation-go container, not to another container or the host", check.name, value)
+		}
+	}
+}
+
+func resolveEnv(name string, aliases []string, fallback string) (string, string, bool) {
+	keys := append([]string{name}, aliases...)
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value, key, true
+		}
+	}
+	return fallback, "default", false
+}
+
+func maskSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 4 {
+		return "****"
+	}
+	return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
+}
+
+func isLoopbackEndpoint(value string) bool {
+	endpoint := strings.TrimPrefix(strings.TrimPrefix(value, "http://"), "https://")
+	host := endpoint
+	if index := strings.Index(host, "/"); index >= 0 {
+		host = host[:index]
+	}
+	if index := strings.LastIndex(host, ":"); index >= 0 {
+		host = host[:index]
+	}
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 func newPostgresPool(ctx context.Context) (*pgxpool.Pool, error) {

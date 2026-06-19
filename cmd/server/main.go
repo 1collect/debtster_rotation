@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -227,9 +228,22 @@ func main() {
 		addr = ":8040"
 	}
 	log.Printf("listening on %s", addr)
-	if err := http.ListenAndServe(addr, withCORS(logRequests(mux))); err != nil {
+	if err := http.ListenAndServe(addr, recoverPanic(withCORS(logRequests(mux)))); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("http panic method=%s path=%s panic=%v stack=%s", r.Method, r.URL.Path, recovered, debug.Stack())
+				writeCORS(w)
+				writeJSONError(w, "Внутренняя ошибка сервера.", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func withCORS(next http.Handler) http.Handler {
