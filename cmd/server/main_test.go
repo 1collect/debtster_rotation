@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -103,14 +105,56 @@ func TestHeaderLikeAttachValueDoesNotBecomeLogin(t *testing.T) {
 	}
 }
 
-func TestRotationWithoutRPIgnoresRPColumn(t *testing.T) {
-	rows := [][]string{
-		{"РП", "ИИН", "Общая задолженность", "Открепить", "Статус", "Закрепить"},
-		{"РП1", "111", "100", "LOGIN_A", "В работе", ""},
-		{"РП2", "111", "200", "LOGIN_B", "В работе", ""},
-		{"РП3", "222", "300", "LOGIN_A", "В работе", ""},
+func TestCrossRPRotationWritesSourceRPAndKeepsRowBalance(t *testing.T) {
+	workbook := excelize.NewFile()
+	sheet := workbook.GetSheetName(0)
+	headers := []any{"РП", "ИИН", "Общая задолженность", "Открепить", "Статус", "Закрепить"}
+	for col, value := range headers {
+		if err := setCell(workbook, sheet, 1, col+1, value); err != nil {
+			t.Fatal(err)
+		}
 	}
-	header, err := readHeaderFromRows(rows)
+	rows := [][]any{
+		{"РП_A", "999", "1000", "LOGIN_A", "Оплата ПВ", ""},
+		{"РП_A", "111", "1000", "LOGIN_A", "В работе", ""},
+		{"РП_B", "222", "1", "LOGIN_B", "В работе", ""},
+	}
+	for rowIndex, row := range rows {
+		for col, value := range row {
+			if err := setCell(workbook, sheet, rowIndex+2, col+1, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	var input bytes.Buffer
+	if err := workbook.Write(&input); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &server{
+		hub:  &progressHub{clients: make(map[string]map[chan payload]bool)},
+		jobs: make(map[string]*jobResult),
+	}
+	output, err := redistributeWorkbook(context.Background(), bytes.NewReader(input.Bytes()), "test-cross-rp", app, workbookConfig{
+		fixedStatuses: rotationFixedStatuses,
+		sourceColumn:  "detach",
+		strategy:      "cross_rp",
+		processName:   "ротации между РП",
+		summaryTitle:  "Итоги ротации между РП",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := excelize.OpenReader(bytes.NewReader(output))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Close()
+
+	resultSheet := result.GetSheetName(0)
+	header, err := readHeader(result, resultSheet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,40 +162,22 @@ func TestRotationWithoutRPIgnoresRPColumn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	groupsByKey, groups, _, _, _, _ := collectGroupsFromRowsForMode(nil, "", rows, cols, map[string]bool{}, "detach", true)
-	if len(groupsByKey) != 2 {
-		t.Fatalf("group count = %d, want 2", len(groupsByKey))
-	}
-	first := groupsByKey[makeGroupKey(ignoredRPName, "000000000111")]
-	if first == nil {
-		t.Fatal("missing merged IIN group")
-	}
-	if first.rp != ignoredRPName {
-		t.Fatalf("group rp = %q, want %q", first.rp, ignoredRPName)
-	}
-	if len(first.rows) != 2 {
-		t.Fatalf("merged row count = %d, want 2", len(first.rows))
-	}
-	if first.amount.String() != "300" {
-		t.Fatalf("merged amount = %s, want 300", first.amount.String())
-	}
-	if len(groups) != 2 {
-		t.Fatalf("ordered group count = %d, want 2", len(groups))
+	if cols.sourceRP == 0 {
+		t.Fatal("missing Исходное рп column")
 	}
 
-	loginKeys := readLoginKeysFromRowsForMode(rows, cols, "detach", true)
-	want := []loginKey{
-		{rp: ignoredRPName, login: "LOGIN_A"},
-		{rp: ignoredRPName, login: "LOGIN_B"},
+	expensiveRowRP := normalizeRP(getCell(result, resultSheet, 3, cols.rp))
+	expensiveRowSourceRP := normalizeRP(getCell(result, resultSheet, 3, cols.sourceRP))
+	expensiveRowLogin := normalizeLogin(getCell(result, resultSheet, 3, cols.attach))
+	if expensiveRowRP != "РП_A" || expensiveRowSourceRP != "РП_A" || expensiveRowLogin != "LOGIN_A" {
+		t.Fatalf("expensive row = rp/source/login %q/%q/%q, want РП_A/РП_A/LOGIN_A", expensiveRowRP, expensiveRowSourceRP, expensiveRowLogin)
 	}
-	if len(loginKeys) != len(want) {
-		t.Fatalf("login key count = %d, want %d: %+v", len(loginKeys), len(want), loginKeys)
-	}
-	for i := range want {
-		if loginKeys[i] != want[i] {
-			t.Fatalf("login key %d = %+v, want %+v", i, loginKeys[i], want[i])
-		}
+
+	smallRowRP := normalizeRP(getCell(result, resultSheet, 4, cols.rp))
+	smallRowSourceRP := normalizeRP(getCell(result, resultSheet, 4, cols.sourceRP))
+	smallRowLogin := normalizeLogin(getCell(result, resultSheet, 4, cols.attach))
+	if smallRowRP != "РП_B" || smallRowSourceRP != "РП_B" || smallRowLogin != "LOGIN_B" {
+		t.Fatalf("small row = rp/source/login %q/%q/%q, want РП_B/РП_B/LOGIN_B", smallRowRP, smallRowSourceRP, smallRowLogin)
 	}
 }
 

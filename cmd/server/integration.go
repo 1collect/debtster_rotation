@@ -81,7 +81,33 @@ func initIntegrations(ctx context.Context) *appIntegrations {
 		integrations.s3Bucket = bucket
 	}
 
+	integrations.cancelInterruptedRotationRecords(ctx)
+
 	return integrations
+}
+
+func (i *appIntegrations) cancelInterruptedRotationRecords(ctx context.Context) {
+	if i == nil || i.mongo == nil {
+		return
+	}
+
+	now := time.Now()
+	result, err := i.mongo.Collection(rotationRecordsCollection).UpdateMany(ctx,
+		bson.M{"status": bson.M{"$in": []string{"running", "processing"}}},
+		bson.M{"$set": bson.M{
+			"status":       "canceled",
+			"message":      "Задача остановлена после перезапуска сервиса.",
+			"completed_at": now,
+			"updated_at":   now,
+		}},
+	)
+	if err != nil {
+		log.Printf("stale running records cleanup failed: %v", err)
+		return
+	}
+	if result.ModifiedCount > 0 {
+		log.Printf("stale running records canceled count=%d", result.ModifiedCount)
+	}
 }
 
 type envCheck struct {
@@ -483,7 +509,7 @@ func (s *server) saveRotationResult(ctx context.Context, jobID, filename string,
 
 func validProcessType(process string) bool {
 	switch normalizeProcessType(process) {
-	case "rotation", "rotation_no_rp", "alignment":
+	case "rotation", "rotation_between_rp", "alignment":
 		return true
 	default:
 		return false
@@ -491,26 +517,28 @@ func validProcessType(process string) bool {
 }
 
 func normalizeProcessType(process string) string {
-	switch process {
+	normalized := strings.ToLower(strings.TrimSpace(process))
+	switch normalized {
 	case "rotation_parallel":
 		return "rotation"
+	case "rotation_between_rp", "between_rp", "rotate_between_rp", "rotation_no_rp", "rotation_between", "between", "cross_rp", "между рп", "ротация между рп":
+		return "rotation_between_rp"
 	case "balance", "alignment_slow", "alignment_parallel":
 		return "alignment"
 	default:
-		return process
+		return normalized
 	}
 }
 
 func configForProcess(process string) workbookConfig {
 	switch normalizeProcessType(process) {
-	case "rotation_no_rp":
+	case "rotation_between_rp":
 		return workbookConfig{
 			fixedStatuses: rotationFixedStatuses,
 			sourceColumn:  "detach",
-			strategy:      "full_parallel",
-			processName:   "ротации без РП",
-			summaryTitle:  "Итоги ротации без РП",
-			ignoreRP:      true,
+			strategy:      "cross_rp",
+			processName:   "ротации между РП",
+			summaryTitle:  "Итоги ротации между РП",
 		}
 	case "alignment":
 		return workbookConfig{
@@ -533,8 +561,8 @@ func configForProcess(process string) workbookConfig {
 
 func resultFilename(process string) string {
 	switch normalizeProcessType(process) {
-	case "rotation_no_rp":
-		return "rotation_no_rp_result.xlsx"
+	case "rotation_between_rp":
+		return "rotation_between_rp_result.xlsx"
 	case "alignment":
 		return "alignment_result.xlsx"
 	default:

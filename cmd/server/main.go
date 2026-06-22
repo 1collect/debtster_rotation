@@ -116,7 +116,7 @@ type progressHub struct {
 }
 
 type columns struct {
-	rp, iin, detach, attach, status, amount int
+	rp, iin, detach, attach, status, amount, sourceRP int
 }
 
 type loginKey struct {
@@ -151,7 +151,6 @@ type workbookConfig struct {
 	strategy      string
 	processName   string
 	summaryTitle  string
-	ignoreRP      bool
 }
 
 type workbookDiagnostics struct {
@@ -199,8 +198,6 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-const ignoredRPName = "Все РП"
-
 func main() {
 	app := &server{
 		hub:  &progressHub{clients: make(map[string]map[chan payload]bool)},
@@ -218,7 +215,7 @@ func main() {
 	mux.HandleFunc("/api/jobs/", app.requireAuth(app.jobAction))
 	mux.HandleFunc("/api/history/clear", app.requireAuth(app.clearHistory))
 	mux.HandleFunc("/rotate-parallel/", app.requireAuth(app.rotateParallelFile))
-	mux.HandleFunc("/rotate-no-rp/", app.requireAuth(app.rotateNoRPFile))
+	mux.HandleFunc("/rotate-between-rp/", app.requireAuth(app.rotateBetweenRPFile))
 	mux.HandleFunc("/balance/", app.requireAuth(app.balanceFile))
 	mux.HandleFunc("/download/", app.requireAuth(app.downloadFile))
 	mux.HandleFunc("/ws/rotation/", app.requireAuth(app.websocket))
@@ -333,14 +330,14 @@ func (s *server) rotateParallelFile(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"job_id": jobID, "state": "running"})
 }
 
-func (s *server) rotateNoRPFile(w http.ResponseWriter, r *http.Request) {
+func (s *server) rotateBetweenRPFile(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	file, uploadedFilename, jobID, err := validateUpload(r)
 	if err != nil {
-		log.Printf("upload rejected process=rotation_no_rp job=%s error=%q", jobID, err.Error())
+		log.Printf("upload rejected process=rotation_between_rp job=%s error=%q", jobID, err.Error())
 		writeJSONError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -348,21 +345,20 @@ func (s *server) rotateNoRPFile(w http.ResponseWriter, r *http.Request) {
 
 	content, err := io.ReadAll(file)
 	if err != nil {
-		log.Printf("upload read failed process=rotation_no_rp job=%s file=%q error=%v", jobID, uploadedFilename, err)
+		log.Printf("upload read failed process=rotation_between_rp job=%s file=%q error=%v", jobID, uploadedFilename, err)
 		writeJSONError(w, "Не удалось прочитать файл.", http.StatusBadRequest)
 		return
 	}
-	log.Printf("upload accepted process=rotation_no_rp job=%s file=%q bytes=%d", jobID, uploadedFilename, len(content))
+	log.Printf("upload accepted process=rotation_between_rp job=%s file=%q bytes=%d", jobID, uploadedFilename, len(content))
 
-	if !s.startJob(content, jobID, "rotation_no_rp", "rotation_no_rp_result.xlsx", workbookConfig{
+	if !s.startJob(content, jobID, "rotation_between_rp", "rotation_between_rp_result.xlsx", workbookConfig{
 		fixedStatuses: rotationFixedStatuses,
 		sourceColumn:  "detach",
-		strategy:      "full_parallel",
-		processName:   "ротации без РП",
-		summaryTitle:  "Итоги ротации без РП",
-		ignoreRP:      true,
+		strategy:      "cross_rp",
+		processName:   "ротации между РП",
+		summaryTitle:  "Итоги ротации между РП",
 	}) {
-		log.Printf("job rejected process=rotation_no_rp job=%s reason=running_job_exists", jobID)
+		log.Printf("job rejected process=rotation_between_rp job=%s reason=running_job_exists", jobID)
 		writeJSONError(w, "Дождитесь завершения предыдущей операции или отмените ее.", http.StatusConflict)
 		return
 	}
@@ -429,7 +425,7 @@ func (s *server) startJob(content []byte, jobID, process, filename string, cfg w
 	s.jobs[jobID] = job
 	s.mu.Unlock()
 
-	log.Printf("job started process=%s job=%s bytes=%d strategy=%s source_column=%s ignore_rp=%t", process, jobID, len(content), cfg.strategy, cfg.sourceColumn, cfg.ignoreRP)
+	log.Printf("job started process=%s job=%s bytes=%d strategy=%s source_column=%s", process, jobID, len(content), cfg.strategy, cfg.sourceColumn)
 	s.sendProgress(jobID, 1, fmt.Sprintf("Задача %s создана, запускаю обработку", cfg.processName))
 	go s.runJob(ctx, content, jobID, filename, cfg)
 	return true
@@ -618,7 +614,15 @@ func (s *server) jobAction(w http.ResponseWriter, r *http.Request) {
 	job := s.jobs[jobID]
 	if job == nil {
 		s.mu.Unlock()
-		writeJSONError(w, "Задача не найдена.", http.StatusNotFound)
+		_ = s.updateRotationRecord(r.Context(), jobID, bson.M{
+			"status":       "canceled",
+			"message":      "Задача отменена после перезапуска сервиса.",
+			"completed_at": time.Now(),
+		})
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"state":   "canceled",
+			"message": "Задача отменена после перезапуска сервиса.",
+		})
 		return
 	}
 	view := s.jobViewLocked(job, true)
@@ -724,10 +728,18 @@ func (s *server) websocket(w http.ResponseWriter, r *http.Request) {
 			_ = conn.WriteJSON(payload{"type": "job_ready", "message": job.message, "last_comment": job.message, "download_url": "/download/" + jobID + "/"})
 		}
 	} else {
+		message := "Задача остановлена после перезапуска сервиса."
+		_ = s.updateRotationRecord(r.Context(), jobID, bson.M{
+			"status":       "canceled",
+			"message":      message,
+			"completed_at": time.Now(),
+		})
 		_ = conn.WriteJSON(payload{
-			"type":    "progress",
-			"percent": 0,
-			"message": "Готов к загрузке файла",
+			"type":         "job_canceled",
+			"percent":      0,
+			"message":      message,
+			"last_comment": message,
+			"state":        "canceled",
 		})
 	}
 	s.mu.Unlock()
@@ -941,9 +953,9 @@ func redistributeWorkbook(ctx context.Context, input io.Reader, jobID string, ap
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	diagnostics := diagnoseRowsForMode(rows, cols, cfg.fixedStatuses, cfg.sourceColumn, cfg.ignoreRP)
+	diagnostics := diagnoseRows(rows, cols, cfg.fixedStatuses, cfg.sourceColumn)
 	log.Printf(
-		"workbook diagnostics job=%s process=%s sheet=%q rows=%d repeated_headers=%d missing_rp=%d missing_iin=%d missing_login=%d fixed_rows=%d rotation_rows=%d distinct_logins=%d ignore_rp=%t source_column=%s",
+		"workbook diagnostics job=%s process=%s sheet=%q rows=%d repeated_headers=%d missing_rp=%d missing_iin=%d missing_login=%d fixed_rows=%d rotation_rows=%d distinct_logins=%d source_column=%s",
 		jobID,
 		cfg.processName,
 		sheet,
@@ -955,7 +967,6 @@ func redistributeWorkbook(ctx context.Context, input io.Reader, jobID string, ap
 		diagnostics.fixedRows,
 		diagnostics.rotationRows,
 		diagnostics.distinctLogins,
-		cfg.ignoreRP,
 		cfg.sourceColumn,
 	)
 	app.sendProgress(jobID, 12, fmt.Sprintf(
@@ -967,13 +978,13 @@ func redistributeWorkbook(ctx context.Context, input io.Reader, jobID string, ap
 		diagnostics.missingIIN,
 		diagnostics.missingLogin,
 	))
-	groupsByKey, groups, loads, loginIINs, fixedCount, fixedIINCount := collectGroupsFromRowsForMode(workbook, sheet, rows, cols, cfg.fixedStatuses, cfg.sourceColumn, cfg.ignoreRP)
+	groupsByKey, groups, loads, loginIINs, fixedCount, fixedIINCount := collectGroupsFromRows(workbook, sheet, rows, cols, cfg.fixedStatuses, cfg.sourceColumn)
 	if len(groupsByKey) == 0 {
 		log.Printf("workbook rejected job=%s process=%s reason=no_groups fixed_rows=%d missing_iin=%d missing_login=%d missing_rp=%d", jobID, cfg.processName, diagnostics.fixedRows, diagnostics.missingIIN, diagnostics.missingLogin, diagnostics.missingRP)
 		return nil, fmt.Errorf("Нет строк для %s после фиксации материалов по статусам.", cfg.processName)
 	}
 
-	loginKeys := readLoginKeysFromRowsForMode(rows, cols, cfg.sourceColumn, cfg.ignoreRP)
+	loginKeys := readLoginKeysFromRows(rows, cols, cfg.sourceColumn)
 	if len(loginKeys) == 0 {
 		log.Printf("workbook rejected job=%s process=%s reason=no_logins source_column=%s missing_login=%d", jobID, cfg.processName, cfg.sourceColumn, diagnostics.missingLogin)
 		return nil, errors.New("Не найдены логины для распределения.")
@@ -985,17 +996,15 @@ func redistributeWorkbook(ctx context.Context, input io.Reader, jobID string, ap
 	app.sendProgress(jobID, 32, fmt.Sprintf("Логинов: %d, ИИН в ротации: %d, строк в ротации: %d, зафиксировано строк: %d, зафиксировано ИИН: %d", len(loginKeys), len(groupsByKey), diagnostics.rotationRows, fixedCount, fixedIINCount))
 	ensureLoadsForAllLogins(loads, loginIINs, loginKeys)
 
-	targetScope := "по РП"
-	if cfg.ignoreRP {
-		targetScope = "без учета РП"
-	}
-	app.sendProgress(jobID, 48, "Считаю нагрузку по логинам и подбираю распределение "+targetScope)
+	app.sendProgress(jobID, 48, "Считаю нагрузку по логинам и подбираю распределение по РП")
 	var assignments map[string]loginKey
 	progress := func(percent int, message string) {
 		app.sendProgress(jobID, percent, message)
 	}
 	if cfg.strategy == "partial" {
 		assignments, err = partiallyBalanceGroups(ctx, groups, loginKeys, loads, loginIINs, progress)
+	} else if cfg.strategy == "cross_rp" {
+		assignments, err = balanceGroupsAcrossRP(ctx, groups, loginKeys, loads, loginIINs, progress)
 	} else if cfg.strategy == "full_parallel" {
 		assignments, err = balanceGroupsParallel(ctx, groups, loginKeys, loads, loginIINs, progress)
 	} else {
@@ -1013,6 +1022,14 @@ func redistributeWorkbook(ctx context.Context, input io.Reader, jobID string, ap
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if cfg.strategy == "cross_rp" {
+		sourceRPCol, err := ensureSourceRPColumn(workbook, sheet, rows, cols)
+		if err != nil {
+			return nil, fmt.Errorf("Не удалось создать колонку Исходное рп: %w", err)
+		}
+		cols.sourceRP = sourceRPCol
+		fillSourceRPColumn(workbook, sheet, rows, cols)
+	}
 	app.sendProgress(jobID, 70, fmt.Sprintf("Распределено ИИН: %d. Заполняю колонку \"Закрепить\" для %d строк", len(assignments), rotationRowCount))
 	for key, group := range groupsByKey {
 		login := assignments[key]
@@ -1020,14 +1037,20 @@ func redistributeWorkbook(ctx context.Context, input io.Reader, jobID string, ap
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
+			if cfg.strategy == "cross_rp" {
+				_ = setCell(workbook, sheet, rowNumber, cols.rp, login.rp)
+			}
 			_ = setCell(workbook, sheet, rowNumber, cols.attach, login.login)
 		}
 	}
 
 	_ = styleAttachColumn(workbook, sheet, cols.attach)
+	if cfg.strategy == "cross_rp" {
+		_ = styleSourceRPColumn(workbook, sheet, cols.sourceRP)
+	}
 
 	app.sendProgress(jobID, 84, "Формирую лист с итогами")
-	summaryLoads, _ := collectFinalLoadsForMode(workbook, sheet, cols, cfg.ignoreRP)
+	summaryLoads, _ := collectFinalLoads(workbook, sheet, cols)
 	if err := replaceSummarySheet(workbook, summaryLoads, fixedCount, fixedIINCount, cfg.summaryTitle); err != nil {
 		return nil, fmt.Errorf("Не удалось сформировать лист итогов: %w", err)
 	}
@@ -1068,11 +1091,12 @@ func readHeaderFromRows(rows [][]string) (map[string]int, error) {
 
 func findColumns(header map[string]int) (columns, error) {
 	cols := columns{
-		rp:     header["рп"],
-		iin:    header["иин"],
-		detach: header["открепить"],
-		attach: header["закрепить"],
-		status: header["статус"],
+		rp:       header["рп"],
+		iin:      header["иин"],
+		detach:   header["открепить"],
+		attach:   header["закрепить"],
+		status:   header["статус"],
+		sourceRP: header["исходное рп"],
 	}
 	for name, col := range header {
 		if strings.HasPrefix(name, "общая задолженность") {
@@ -1115,11 +1139,7 @@ func collectGroups(workbook *excelize.File, sheet string, maxRow int, cols colum
 	return collectGroupsFromRows(workbook, sheet, rows, cols, fixedStatuses, sourceColumn)
 }
 
-func collectGroupsFromRows(workbook *excelize.File, sheet string, rows [][]string, cols columns, fixedStatuses map[string]bool, sourceColumn string) (map[string]*iinGroup, []*iinGroup, map[loginKey]*load, map[loginKey]map[string]bool, int, int) {
-	return collectGroupsFromRowsForMode(workbook, sheet, rows, cols, fixedStatuses, sourceColumn, false)
-}
-
-func diagnoseRowsForMode(rows [][]string, cols columns, fixedStatuses map[string]bool, sourceColumn string, ignoreRP bool) workbookDiagnostics {
+func diagnoseRows(rows [][]string, cols columns, fixedStatuses map[string]bool, sourceColumn string) workbookDiagnostics {
 	diagnostics := workbookDiagnostics{}
 	seenLogins := make(map[loginKey]bool)
 	for rowIndex := 1; rowIndex < len(rows); rowIndex++ {
@@ -1130,7 +1150,7 @@ func diagnoseRowsForMode(rows [][]string, cols columns, fixedStatuses map[string
 			continue
 		}
 
-		rp := effectiveRP(getRowCell(row, cols.rp), ignoreRP)
+		rp := normalizeRP(getRowCell(row, cols.rp))
 		iin := normalizeIIN(getRowCell(row, cols.iin))
 		currentLogin := readSourceLoginFromRow(row, cols, sourceColumn)
 		if rp == "" {
@@ -1161,7 +1181,7 @@ func diagnoseRowsForMode(rows [][]string, cols columns, fixedStatuses map[string
 	return diagnostics
 }
 
-func collectGroupsFromRowsForMode(workbook *excelize.File, sheet string, rows [][]string, cols columns, fixedStatuses map[string]bool, sourceColumn string, ignoreRP bool) (map[string]*iinGroup, []*iinGroup, map[loginKey]*load, map[loginKey]map[string]bool, int, int) {
+func collectGroupsFromRows(workbook *excelize.File, sheet string, rows [][]string, cols columns, fixedStatuses map[string]bool, sourceColumn string) (map[string]*iinGroup, []*iinGroup, map[loginKey]*load, map[loginKey]map[string]bool, int, int) {
 	groups := make(map[string]*iinGroup)
 	groupOrder := make([]*iinGroup, 0)
 	loads := make(map[loginKey]*load)
@@ -1176,7 +1196,7 @@ func collectGroupsFromRowsForMode(workbook *excelize.File, sheet string, rows []
 		if isRepeatedHeaderRow(row, cols) {
 			continue
 		}
-		rp := effectiveRP(getRowCell(row, cols.rp), ignoreRP)
+		rp := normalizeRP(getRowCell(row, cols.rp))
 		iin := normalizeIIN(getRowCell(row, cols.iin))
 		currentLogin := readSourceLoginFromRow(row, cols, sourceColumn)
 		if rp == "" || iin == "" || currentLogin == "" {
@@ -1229,10 +1249,6 @@ func readLoginKeys(workbook *excelize.File, sheet string, maxRow int, cols colum
 }
 
 func readLoginKeysFromRows(rows [][]string, cols columns, sourceColumn string) []loginKey {
-	return readLoginKeysFromRowsForMode(rows, cols, sourceColumn, false)
-}
-
-func readLoginKeysFromRowsForMode(rows [][]string, cols columns, sourceColumn string, ignoreRP bool) []loginKey {
 	var keys []loginKey
 	seen := make(map[loginKey]bool)
 	for rowIndex := 1; rowIndex < len(rows); rowIndex++ {
@@ -1240,7 +1256,7 @@ func readLoginKeysFromRowsForMode(rows [][]string, cols columns, sourceColumn st
 		if isRepeatedHeaderRow(row, cols) {
 			continue
 		}
-		rp := effectiveRP(getRowCell(row, cols.rp), ignoreRP)
+		rp := normalizeRP(getRowCell(row, cols.rp))
 		login := readSourceLoginFromRow(row, cols, sourceColumn)
 		key := loginKey{rp: rp, login: login}
 		if rp != "" && login != "" && !seen[key] {
@@ -1304,10 +1320,6 @@ func addLoad(loads map[loginKey]*load, loginIINs map[loginKey]map[string]bool, k
 }
 
 func collectFinalLoads(workbook *excelize.File, sheet string, cols columns) (map[loginKey]*load, map[loginKey]map[string]bool) {
-	return collectFinalLoadsForMode(workbook, sheet, cols, false)
-}
-
-func collectFinalLoadsForMode(workbook *excelize.File, sheet string, cols columns, ignoreRP bool) (map[loginKey]*load, map[loginKey]map[string]bool) {
 	rows, err := workbook.GetRows(sheet)
 	if err != nil {
 		rows = nil
@@ -1319,7 +1331,7 @@ func collectFinalLoadsForMode(workbook *excelize.File, sheet string, cols column
 		if isRepeatedHeaderRow(row, cols) {
 			continue
 		}
-		rp := effectiveRP(getRowCell(row, cols.rp), ignoreRP)
+		rp := normalizeRP(getRowCell(row, cols.rp))
 		iin := normalizeIIN(getRowCell(row, cols.iin))
 		login := normalizeLogin(getRowCell(row, cols.attach))
 		if rp == "" || iin == "" || login == "" {
@@ -1332,11 +1344,34 @@ func collectFinalLoadsForMode(workbook *excelize.File, sheet string, cols column
 	return loads, loginIINs
 }
 
-func effectiveRP(value string, ignoreRP bool) string {
-	if ignoreRP {
-		return ignoredRPName
+func ensureSourceRPColumn(workbook *excelize.File, sheet string, rows [][]string, cols columns) (int, error) {
+	if cols.sourceRP > 0 {
+		return cols.sourceRP, nil
 	}
-	return normalizeRP(value)
+
+	column := max(len(rows[0])+1, maxColumn(cols)+1)
+	if err := setCell(workbook, sheet, 1, column, "Исходное рп"); err != nil {
+		return 0, err
+	}
+	return column, nil
+}
+
+func maxColumn(cols columns) int {
+	return max(cols.rp, max(cols.iin, max(cols.detach, max(cols.attach, max(cols.status, max(cols.amount, cols.sourceRP))))))
+}
+
+func fillSourceRPColumn(workbook *excelize.File, sheet string, rows [][]string, cols columns) {
+	for rowIndex := 1; rowIndex < len(rows); rowIndex++ {
+		row := rows[rowIndex]
+		if isRepeatedHeaderRow(row, cols) {
+			continue
+		}
+		rp := normalizeRP(getRowCell(row, cols.rp))
+		if rp == "" {
+			continue
+		}
+		_ = setCell(workbook, sheet, rowIndex+1, cols.sourceRP, rp)
+	}
 }
 
 func normalizeSourceLogin(value string) string {
@@ -1500,12 +1535,109 @@ func partiallyBalanceGroups(ctx context.Context, groups []*iinGroup, loginKeys [
 	return assignments, nil
 }
 
+func balanceGroupsAcrossRP(ctx context.Context, groups []*iinGroup, loginKeys []loginKey, loads map[loginKey]*load, loginIINs map[loginKey]map[string]bool, progress progressFunc) (map[string]loginKey, error) {
+	if len(loginKeys) == 0 {
+		return nil, errors.New("Не найдены логины для распределения между РП.")
+	}
+
+	assignments := make(map[string]loginKey)
+	remainingRowsByRP := rowsBySourceRP(groups)
+	remainingAmountByRP := amountBySourceRP(groups)
+	loginKeysByRP := groupLoginKeysByRP(loginKeys)
+	for rp := range remainingRowsByRP {
+		if len(loginKeysByRP[rp]) == 0 {
+			return nil, fmt.Errorf("Для РП %q нет логинов для распределения.", rp)
+		}
+	}
+
+	targets := targetsForLogins(groups, loginKeys, loads, loginIINs)
+	reportProgress(progress, 50, "Целевая нагрузка по всем РП рассчитана")
+
+	orderedGroups := append([]*iinGroup(nil), groups...)
+	sort.SliceStable(orderedGroups, func(i, j int) bool {
+		return groupWeight(orderedGroups[i], targets).GreaterThan(groupWeight(orderedGroups[j], targets))
+	})
+	reportProgress(progress, 52, fmt.Sprintf("Группы отсортированы по весу: %d ИИН", len(orderedGroups)))
+
+	counter := newProgressCounter(progress, 52, 68, len(orderedGroups), "Распределение между РП")
+	for _, group := range orderedGroups {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		candidates := loginKeysWithCapacity(loginKeys, remainingRowsByRP, remainingAmountByRP, group)
+		if len(candidates) == 0 {
+			candidates = fallbackLoginKeys(loginKeys, remainingRowsByRP, group.rp)
+		}
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("Не найден РП с доступным местом для ИИН %s.", group.iin)
+		}
+
+		groupKey := makeGroupKey(group.rp, group.iin)
+		var selected loginKey
+		if group.pinnedLogin != "" {
+			selected = loginKey{rp: group.rp, login: group.pinnedLogin}
+			if !containsLoginKey(candidates, selected) {
+				candidates = append([]loginKey{selected}, candidates...)
+			}
+		} else {
+			baseScores := loginScoresForLogins(loads, candidates, targets, rotationScoreWeights)
+			selected, _ = bestCandidateAfterAdd(loads, loginIINs, candidates, baseScores, group, targets, rotationScoreWeights)
+		}
+
+		assignments[groupKey] = selected
+		remainingRowsByRP[selected.rp] -= len(group.rows)
+		remainingAmountByRP[selected.rp] = pySub(remainingAmountByRP[selected.rp], group.amount)
+		addLoad(loads, loginIINs, selected, group.iin, group.amount, len(group.rows))
+		counter.add(1)
+	}
+
+	reportProgress(progress, 68, "Распределение между РП подобрано")
+	return assignments, nil
+}
+
 func groupLoginKeysByRP(loginKeys []loginKey) map[string][]loginKey {
 	out := make(map[string][]loginKey)
 	for _, key := range loginKeys {
 		out[key.rp] = append(out[key.rp], key)
 	}
 	return out
+}
+
+func rowsBySourceRP(groups []*iinGroup) map[string]int {
+	rows := make(map[string]int)
+	for _, group := range groups {
+		rows[group.rp] += len(group.rows)
+	}
+	return rows
+}
+
+func amountBySourceRP(groups []*iinGroup) map[string]decimal.Decimal {
+	amounts := make(map[string]decimal.Decimal)
+	for _, group := range groups {
+		amounts[group.rp] = pyAdd(amounts[group.rp], group.amount)
+	}
+	return amounts
+}
+
+func loginKeysWithCapacity(loginKeys []loginKey, remainingRowsByRP map[string]int, remainingAmountByRP map[string]decimal.Decimal, group *iinGroup) []loginKey {
+	var candidates []loginKey
+	for _, key := range loginKeys {
+		if remainingRowsByRP[key.rp] >= len(group.rows) && remainingAmountByRP[key.rp].GreaterThanOrEqual(group.amount) {
+			candidates = append(candidates, key)
+		}
+	}
+	return candidates
+}
+
+func fallbackLoginKeys(loginKeys []loginKey, remainingRowsByRP map[string]int, sourceRP string) []loginKey {
+	var candidates []loginKey
+	for _, key := range loginKeys {
+		if remainingRowsByRP[key.rp] > 0 || key.rp == sourceRP {
+			candidates = append(candidates, key)
+		}
+	}
+	return candidates
 }
 
 func groupGroupsByRP(groups []*iinGroup) map[string][]*iinGroup {
@@ -1569,6 +1701,35 @@ func filterAssignmentsForGroups(assignments map[string]loginKey, groups []*iinGr
 }
 
 func targetsForRP(groups []*iinGroup, loginKeys []loginKey, loads map[loginKey]*load, loginIINs map[loginKey]map[string]bool) [3]decimal.Decimal {
+	loginCount := decimal.NewFromInt(int64(len(loginKeys)))
+	totalCount := 0
+	totalIIN := 0
+	totalAmount := decimal.Zero
+	for _, key := range loginKeys {
+		totalCount += loads[key].count
+		totalIIN += loads[key].iinCount
+		totalAmount = pyAdd(totalAmount, loads[key].amount)
+	}
+	for _, group := range groups {
+		totalCount += len(group.rows)
+		totalAmount = pyAdd(totalAmount, group.amount)
+		if group.pinnedLogin == "" || !loginIINs[loginKey{rp: group.rp, login: group.pinnedLogin}][group.iin] {
+			totalIIN++
+		}
+	}
+	if loginCount.IsZero() {
+		return [3]decimal.Decimal{decimal.Zero, decimal.NewFromInt(1), decimal.Zero}
+	}
+	targetCount := pyDiv(decimal.NewFromInt(int64(totalCount)), loginCount)
+	targetIIN := pyDiv(decimal.NewFromInt(int64(totalIIN)), loginCount)
+	targetAmount := pyDiv(totalAmount, loginCount)
+	if targetAmount.IsZero() {
+		targetAmount = decimal.NewFromInt(1)
+	}
+	return [3]decimal.Decimal{targetIIN, targetAmount, targetCount}
+}
+
+func targetsForLogins(groups []*iinGroup, loginKeys []loginKey, loads map[loginKey]*load, loginIINs map[loginKey]map[string]bool) [3]decimal.Decimal {
 	loginCount := decimal.NewFromInt(int64(len(loginKeys)))
 	totalCount := 0
 	totalIIN := 0
@@ -2158,6 +2319,23 @@ func styleAttachColumn(workbook *excelize.File, sheet string, column int) error 
 	width, err := workbook.GetColWidth(sheet, colName)
 	if err != nil || width < 18 {
 		width = 18
+	}
+	return workbook.SetColWidth(sheet, colName, colName, width)
+}
+
+func styleSourceRPColumn(workbook *excelize.File, sheet string, column int) error {
+	colName, err := excelize.ColumnNumberToName(column)
+	if err != nil {
+		return err
+	}
+	style, _ := workbook.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"FFF2CC"}, Pattern: 1},
+	})
+	_ = workbook.SetCellStyle(sheet, colName+"1", colName+"1", style)
+	width, err := workbook.GetColWidth(sheet, colName)
+	if err != nil || width < 16 {
+		width = 16
 	}
 	return workbook.SetColWidth(sheet, colName, colName, width)
 }
