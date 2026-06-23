@@ -105,7 +105,7 @@ func TestHeaderLikeAttachValueDoesNotBecomeLogin(t *testing.T) {
 	}
 }
 
-func TestCrossRPRotationWritesSourceRPAndKeepsRowBalance(t *testing.T) {
+func TestCrossRPRotationWritesSourceRPAndExchangesEqualMaterialCount(t *testing.T) {
 	workbook := excelize.NewFile()
 	sheet := workbook.GetSheetName(0)
 	headers := []any{"РП", "ИИН", "Общая задолженность", "Открепить", "Статус", "Закрепить"}
@@ -169,15 +169,15 @@ func TestCrossRPRotationWritesSourceRPAndKeepsRowBalance(t *testing.T) {
 	expensiveRowRP := normalizeRP(getCell(result, resultSheet, 3, cols.rp))
 	expensiveRowSourceRP := normalizeRP(getCell(result, resultSheet, 3, cols.sourceRP))
 	expensiveRowLogin := normalizeLogin(getCell(result, resultSheet, 3, cols.attach))
-	if expensiveRowRP != "РП_A" || expensiveRowSourceRP != "РП_A" || expensiveRowLogin != "LOGIN_A" {
-		t.Fatalf("expensive row = rp/source/login %q/%q/%q, want РП_A/РП_A/LOGIN_A", expensiveRowRP, expensiveRowSourceRP, expensiveRowLogin)
+	if expensiveRowRP != "РП_B" || expensiveRowSourceRP != "РП_A" || expensiveRowLogin != "LOGIN_B" {
+		t.Fatalf("expensive row = rp/source/login %q/%q/%q, want РП_B/РП_A/LOGIN_B", expensiveRowRP, expensiveRowSourceRP, expensiveRowLogin)
 	}
 
 	smallRowRP := normalizeRP(getCell(result, resultSheet, 4, cols.rp))
 	smallRowSourceRP := normalizeRP(getCell(result, resultSheet, 4, cols.sourceRP))
 	smallRowLogin := normalizeLogin(getCell(result, resultSheet, 4, cols.attach))
-	if smallRowRP != "РП_B" || smallRowSourceRP != "РП_B" || smallRowLogin != "LOGIN_B" {
-		t.Fatalf("small row = rp/source/login %q/%q/%q, want РП_B/РП_B/LOGIN_B", smallRowRP, smallRowSourceRP, smallRowLogin)
+	if smallRowRP != "РП_A" || smallRowSourceRP != "РП_B" || smallRowLogin != "LOGIN_A" {
+		t.Fatalf("small row = rp/source/login %q/%q/%q, want РП_A/РП_B/LOGIN_A", smallRowRP, smallRowSourceRP, smallRowLogin)
 	}
 }
 

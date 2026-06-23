@@ -126,6 +126,7 @@ type loginKey struct {
 
 type iinGroup struct {
 	rp           string
+	sourceRP     string
 	iin          string
 	rows         []int
 	amount       decimal.Decimal
@@ -1487,7 +1488,7 @@ func balanceGroupsParallel(ctx context.Context, groups []*iinGroup, loginKeys []
 func balanceGroupsForRP(groups []*iinGroup, rpLoginKeys []loginKey, loads map[loginKey]*load, loginIINs map[loginKey]map[string]bool, targets [3]decimal.Decimal, counter *progressCounter) (map[string]loginKey, error) {
 	assignments := make(map[string]loginKey)
 	for _, group := range groups {
-		groupKey := makeGroupKey(group.rp, group.iin)
+		groupKey := groupAssignmentKey(group)
 		if len(rpLoginKeys) == 0 {
 			return nil, fmt.Errorf("Для РП %q нет логинов для распределения.", group.rp)
 		}
@@ -1519,7 +1520,7 @@ func partiallyBalanceGroups(ctx context.Context, groups []*iinGroup, loginKeys [
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		groupKey := makeGroupKey(group.rp, group.iin)
+		groupKey := groupAssignmentKey(group)
 		login := loginKey{rp: group.rp, login: firstNonEmpty(group.pinnedLogin, group.currentLogin)}
 		if !containsLoginKey(loginKeysByRP[group.rp], login) {
 			return nil, fmt.Errorf("Для ИИН %s не найден текущий логин в РП %q.", group.iin, group.rp)
@@ -1539,61 +1540,185 @@ func balanceGroupsAcrossRP(ctx context.Context, groups []*iinGroup, loginKeys []
 	if len(loginKeys) == 0 {
 		return nil, errors.New("Не найдены логины для распределения между РП.")
 	}
-
-	assignments := make(map[string]loginKey)
-	remainingRowsByRP := rowsBySourceRP(groups)
-	remainingAmountByRP := amountBySourceRP(groups)
 	loginKeysByRP := groupLoginKeysByRP(loginKeys)
-	for rp := range remainingRowsByRP {
+	for rp := range groupGroupsByRP(groups) {
 		if len(loginKeysByRP[rp]) == 0 {
 			return nil, fmt.Errorf("Для РП %q нет логинов для распределения.", rp)
 		}
 	}
 
-	targets := targetsForLogins(groups, loginKeys, loads, loginIINs)
-	reportProgress(progress, 50, "Целевая нагрузка по всем РП рассчитана")
+	reportProgress(progress, 50, "Сначала рассчитываю полноценную ротацию внутри каждого РП")
+	targetRPByGroup := exchangeGroupsBetweenRP(ctx, groups, loginKeysByRP, loads, progress)
+	targetedGroups := groupsWithTargetRP(groups, targetRPByGroup)
+	reportProgress(progress, 58, "Обмен между РП подобран: сколько материалов пришло, столько же ушло")
+	assignments, err := balanceGroupsParallel(ctx, targetedGroups, loginKeys, loads, loginIINs, progress)
+	if err != nil {
+		return nil, err
+	}
+	reportProgress(progress, 68, "Финальная ротация внутри целевых РП завершена")
+	return assignments, nil
+}
 
-	orderedGroups := append([]*iinGroup(nil), groups...)
-	sort.SliceStable(orderedGroups, func(i, j int) bool {
-		return groupWeight(orderedGroups[i], targets).GreaterThan(groupWeight(orderedGroups[j], targets))
-	})
-	reportProgress(progress, 52, fmt.Sprintf("Группы отсортированы по весу: %d ИИН", len(orderedGroups)))
-
-	counter := newProgressCounter(progress, 52, 68, len(orderedGroups), "Распределение между РП")
-	for _, group := range orderedGroups {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		candidates := loginKeysWithCapacity(loginKeys, remainingRowsByRP, remainingAmountByRP, group)
-		if len(candidates) == 0 {
-			candidates = fallbackLoginKeys(loginKeys, remainingRowsByRP, group.rp)
-		}
-		if len(candidates) == 0 {
-			return nil, fmt.Errorf("Не найден РП с доступным местом для ИИН %s.", group.iin)
-		}
-
-		groupKey := makeGroupKey(group.rp, group.iin)
-		var selected loginKey
-		if group.pinnedLogin != "" {
-			selected = loginKey{rp: group.rp, login: group.pinnedLogin}
-			if !containsLoginKey(candidates, selected) {
-				candidates = append([]loginKey{selected}, candidates...)
-			}
-		} else {
-			baseScores := loginScoresForLogins(loads, candidates, targets, rotationScoreWeights)
-			selected, _ = bestCandidateAfterAdd(loads, loginIINs, candidates, baseScores, group, targets, rotationScoreWeights)
-		}
-
-		assignments[groupKey] = selected
-		remainingRowsByRP[selected.rp] -= len(group.rows)
-		remainingAmountByRP[selected.rp] = pySub(remainingAmountByRP[selected.rp], group.amount)
-		addLoad(loads, loginIINs, selected, group.iin, group.amount, len(group.rows))
-		counter.add(1)
+func exchangeGroupsBetweenRP(ctx context.Context, groups []*iinGroup, loginKeysByRP map[string][]loginKey, fixedLoads map[loginKey]*load, progress progressFunc) map[string]string {
+	targetRPByGroup := make(map[string]string, len(groups))
+	for _, group := range groups {
+		targetRPByGroup[groupAssignmentKey(group)] = group.rp
 	}
 
-	reportProgress(progress, 68, "Распределение между РП подобрано")
-	return assignments, nil
+	movableByRPAndCount := movableGroupsByRPAndCount(groups)
+	maxSwaps := len(groups)
+	lastPercent := 50
+	for swaps := 0; swaps < maxSwaps; swaps++ {
+		if err := ctx.Err(); err != nil {
+			return targetRPByGroup
+		}
+		stats := rpAverageStats(groups, targetRPByGroup, loginKeysByRP, fixedLoads)
+		highRP, lowRP, ok := widestRPAverageGap(stats)
+		if !ok {
+			break
+		}
+		highGroup, lowGroup, ok := bestBalancedExchange(movableByRPAndCount, targetRPByGroup, highRP, lowRP)
+		if !ok {
+			break
+		}
+		highKey := groupAssignmentKey(highGroup)
+		lowKey := groupAssignmentKey(lowGroup)
+		targetRPByGroup[highKey] = lowRP
+		targetRPByGroup[lowKey] = highRP
+		lastPercent = reportRangeProgress(progress, 50, 58, swaps+1, maxSwaps, lastPercent, "Подбираю равноценный обмен материалами между РП")
+	}
+	return targetRPByGroup
+}
+
+func movableGroupsByRPAndCount(groups []*iinGroup) map[string]map[int][]*iinGroup {
+	out := make(map[string]map[int][]*iinGroup)
+	for _, group := range groups {
+		if group.pinnedLogin != "" {
+			continue
+		}
+		if out[group.rp] == nil {
+			out[group.rp] = make(map[int][]*iinGroup)
+		}
+		out[group.rp][len(group.rows)] = append(out[group.rp][len(group.rows)], group)
+	}
+	for rp, byCount := range out {
+		for count := range byCount {
+			sort.SliceStable(byCount[count], func(i, j int) bool {
+				return byCount[count][i].amount.GreaterThan(byCount[count][j].amount)
+			})
+		}
+		out[rp] = byCount
+	}
+	return out
+}
+
+type rpAverageStat struct {
+	rp     string
+	amount decimal.Decimal
+	logins int
+	avg    decimal.Decimal
+}
+
+func rpAverageStats(groups []*iinGroup, targetRPByGroup map[string]string, loginKeysByRP map[string][]loginKey, fixedLoads map[loginKey]*load) map[string]rpAverageStat {
+	stats := make(map[string]rpAverageStat)
+	for rp, logins := range loginKeysByRP {
+		stat := stats[rp]
+		stat.rp = rp
+		stat.logins = len(logins)
+		for _, login := range logins {
+			if fixedLoads[login] != nil {
+				stat.amount = pyAdd(stat.amount, fixedLoads[login].amount)
+			}
+		}
+		stats[rp] = stat
+	}
+	for _, group := range groups {
+		targetRP := targetRPByGroup[groupAssignmentKey(group)]
+		stat := stats[targetRP]
+		stat.rp = targetRP
+		stat.amount = pyAdd(stat.amount, group.amount)
+		stats[targetRP] = stat
+	}
+	for rp, stat := range stats {
+		if stat.logins > 0 {
+			stat.avg = pyDiv(stat.amount, decimal.NewFromInt(int64(stat.logins)))
+		}
+		stats[rp] = stat
+	}
+	return stats
+}
+
+func widestRPAverageGap(stats map[string]rpAverageStat) (string, string, bool) {
+	var high rpAverageStat
+	var low rpAverageStat
+	hasHigh := false
+	hasLow := false
+	for _, stat := range stats {
+		if stat.logins == 0 {
+			continue
+		}
+		if !hasHigh || stat.avg.GreaterThan(high.avg) {
+			high = stat
+			hasHigh = true
+		}
+		if !hasLow || stat.avg.LessThan(low.avg) {
+			low = stat
+			hasLow = true
+		}
+	}
+	if !hasHigh || !hasLow || high.rp == low.rp || high.avg.LessThanOrEqual(low.avg) {
+		return "", "", false
+	}
+	return high.rp, low.rp, true
+}
+
+func bestBalancedExchange(groupsByRPAndCount map[string]map[int][]*iinGroup, targetRPByGroup map[string]string, highRP, lowRP string) (*iinGroup, *iinGroup, bool) {
+	var bestHigh *iinGroup
+	var bestLow *iinGroup
+	bestImprovement := decimal.Zero
+	for count, highGroups := range groupsByRPAndCount[highRP] {
+		lowGroups := groupsByRPAndCount[lowRP][count]
+		for _, highGroup := range highGroups {
+			if targetRPByGroup[groupAssignmentKey(highGroup)] != highRP {
+				continue
+			}
+			for lowIndex := len(lowGroups) - 1; lowIndex >= 0; lowIndex-- {
+				lowGroup := lowGroups[lowIndex]
+				if targetRPByGroup[groupAssignmentKey(lowGroup)] != lowRP {
+					continue
+				}
+				improvement := pySub(highGroup.amount, lowGroup.amount)
+				if improvement.GreaterThan(bestImprovement) {
+					bestImprovement = improvement
+					bestHigh = highGroup
+					bestLow = lowGroup
+				}
+				break
+			}
+		}
+	}
+	if bestHigh == nil || bestLow == nil || !bestImprovement.GreaterThan(decimal.Zero) {
+		return nil, nil, false
+	}
+	return bestHigh, bestLow, true
+}
+
+func groupsWithTargetRP(groups []*iinGroup, targetRPByGroup map[string]string) []*iinGroup {
+	out := make([]*iinGroup, 0, len(groups))
+	for _, group := range groups {
+		targetRP := targetRPByGroup[groupAssignmentKey(group)]
+		if targetRP == "" {
+			targetRP = group.rp
+		}
+		cloned := *group
+		cloned.sourceRP = firstNonEmpty(group.sourceRP, group.rp)
+		cloned.rp = targetRP
+		if cloned.rp != cloned.sourceRP {
+			cloned.pinnedLogin = ""
+		}
+		out = append(out, &cloned)
+	}
+	return out
 }
 
 func groupLoginKeysByRP(loginKeys []loginKey) map[string][]loginKey {
@@ -1694,7 +1819,7 @@ func mergePortfolio(loads map[loginKey]*load, loginIINs map[loginKey]map[string]
 func filterAssignmentsForGroups(assignments map[string]loginKey, groups []*iinGroup) map[string]loginKey {
 	filtered := make(map[string]loginKey, len(groups))
 	for _, group := range groups {
-		groupKey := makeGroupKey(group.rp, group.iin)
+		groupKey := groupAssignmentKey(group)
 		filtered[groupKey] = assignments[groupKey]
 	}
 	return filtered
@@ -1940,7 +2065,7 @@ func improveAssignments(ctx context.Context, groups []*iinGroup, assignments map
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			groupKey := makeGroupKey(group.rp, group.iin)
+			groupKey := groupAssignmentKey(group)
 			rpLoginKeys := loginKeysByRP[group.rp]
 			targets := targetsByRP[group.rp]
 			currentScores := loginScoresForLogins(loads, rpLoginKeys, targets, weights)
@@ -2071,7 +2196,7 @@ func improvePartialAssignments(ctx context.Context, groups []*iinGroup, assignme
 			if !ok {
 				break
 			}
-			groupKey := makeGroupKey(bestGroup.rp, bestGroup.iin)
+			groupKey := groupAssignmentKey(bestGroup)
 			currentLogin := assignments[groupKey]
 			removeLoad(loads, loginIINs, currentLogin, bestGroup.iin, bestGroup.amount, len(bestGroup.rows))
 			addLoad(loads, loginIINs, bestLogin, bestGroup.iin, bestGroup.amount, len(bestGroup.rows))
@@ -2147,7 +2272,7 @@ func bestPartialMoveCandidateRange(ctx context.Context, groups []*iinGroup, assi
 			return partialMoveCandidate{}
 		}
 		group := groups[groupIndex]
-		groupKey := makeGroupKey(group.rp, group.iin)
+		groupKey := groupAssignmentKey(group)
 		if movedGroups[groupKey] {
 			continue
 		}
@@ -2552,6 +2677,14 @@ func pyRound(value decimal.Decimal) decimal.Decimal {
 
 func makeGroupKey(rp, iin string) string {
 	return rp + "\x00" + iin
+}
+
+func groupAssignmentKey(group *iinGroup) string {
+	rp := group.rp
+	if group.sourceRP != "" {
+		rp = group.sourceRP
+	}
+	return makeGroupKey(rp, group.iin)
 }
 
 func groupsForRP(groups []*iinGroup, rp string) []*iinGroup {
