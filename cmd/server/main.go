@@ -516,6 +516,10 @@ func (s *server) storeJobError(jobID, message string) {
 	log.Printf("job error stored job=%s message=%q", jobID, message)
 	s.mu.Lock()
 	if job := s.jobs[jobID]; job != nil {
+		if job.state == "canceled" {
+			s.mu.Unlock()
+			return
+		}
 		job.state = "error"
 		job.err = message
 		job.message = message
@@ -533,18 +537,19 @@ func (s *server) storeJobError(jobID, message string) {
 
 func (s *server) storeJobCanceled(jobID string) {
 	log.Printf("job canceled stored job=%s", jobID)
+	now := time.Now()
 	s.mu.Lock()
 	if job := s.jobs[jobID]; job != nil {
 		job.state = "canceled"
 		job.message = "Задача отменена."
-		job.completedAt = time.Now()
+		job.completedAt = now
 		job.cancel = nil
 	}
 	s.mu.Unlock()
-	_ = s.updateRotationRecord(context.Background(), jobID, bson.M{
+	_ = s.updateRotationRecordDetached(jobID, bson.M{
 		"status":       "canceled",
 		"message":      "Задача отменена.",
-		"completed_at": time.Now(),
+		"completed_at": now,
 	})
 	s.hub.send(jobID, payload{"type": "job_canceled", "message": "Задача отменена."})
 }
@@ -630,11 +635,7 @@ func (s *server) jobAction(w http.ResponseWriter, r *http.Request) {
 	job := s.jobs[jobID]
 	if job == nil {
 		s.mu.Unlock()
-		_ = s.updateRotationRecord(r.Context(), jobID, bson.M{
-			"status":       "canceled",
-			"message":      "Задача отменена после перезапуска сервиса.",
-			"completed_at": time.Now(),
-		})
+		_ = s.cancelInterruptedRotationRecord(jobID, "Задача отменена после перезапуска сервиса.", time.Now())
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"state":   "canceled",
 			"message": "Задача отменена после перезапуска сервиса.",
@@ -651,11 +652,13 @@ func (s *server) cancelJob(w http.ResponseWriter, r *http.Request, jobID string)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	now := time.Now()
 	s.mu.Lock()
 	job := s.jobs[jobID]
 	if job == nil {
 		s.mu.Unlock()
-		writeJSONError(w, "Задача не найдена.", http.StatusNotFound)
+		_ = s.cancelInterruptedRotationRecord(jobID, "Задача отменена.", now)
+		_ = json.NewEncoder(w).Encode(map[string]string{"state": "canceled"})
 		return
 	}
 	if job.state != "running" || job.cancel == nil {
@@ -665,26 +668,30 @@ func (s *server) cancelJob(w http.ResponseWriter, r *http.Request, jobID string)
 		return
 	}
 	cancel := job.cancel
-	job.state = "canceling"
-	job.message = "Отменяю задачу."
+	job.state = "canceled"
+	job.message = "Задача отменена."
+	job.completedAt = now
 	job.cancel = nil
 	job.log = append(job.log, progressRecord{At: time.Now(), Percent: job.percent, Message: job.message})
 	percent := job.percent
 	s.mu.Unlock()
-	cancel()
-	_ = s.updateRotationRecord(r.Context(), jobID, bson.M{
-		"status":   "canceling",
-		"progress": percent,
-		"message":  "Отменяю задачу.",
+	if cancel != nil {
+		cancel()
+	}
+	_ = s.updateRotationRecordDetached(jobID, bson.M{
+		"status":       "canceled",
+		"progress":     percent,
+		"message":      "Задача отменена.",
+		"completed_at": now,
 	})
 	s.hub.send(jobID, payload{
-		"type":         "progress",
+		"type":         "job_canceled",
 		"percent":      percent,
-		"message":      "Отменяю задачу.",
-		"last_comment": "Отменяю задачу.",
-		"state":        "canceling",
+		"message":      "Задача отменена.",
+		"last_comment": "Задача отменена.",
+		"state":        "canceled",
 	})
-	_ = json.NewEncoder(w).Encode(map[string]string{"state": "canceling"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"state": "canceled"})
 }
 
 func (s *server) jobViewLocked(job *jobResult, includeLog bool) jobView {
@@ -762,11 +769,7 @@ func (s *server) websocket(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		message := "Задача остановлена после перезапуска сервиса."
-		_ = s.updateRotationRecord(r.Context(), jobID, bson.M{
-			"status":       "canceled",
-			"message":      message,
-			"completed_at": time.Now(),
-		})
+		_ = s.cancelInterruptedRotationRecord(jobID, message, time.Now())
 		_ = conn.WriteJSON(payload{
 			"type":         "job_canceled",
 			"percent":      0,
@@ -1493,7 +1496,7 @@ func balanceGroupsParallel(ctx context.Context, groups []*iinGroup, loginKeys []
 				return
 			}
 			localLoads, localLoginIINs := clonePortfolioForLogins(loads, loginIINs, rpLoginKeys)
-			localAssignments, err := balanceGroupsForRP(rpGroups, rpLoginKeys, localLoads, localLoginIINs, targets, counter)
+			localAssignments, err := balanceGroupsForRP(ctx, rpGroups, rpLoginKeys, localLoads, localLoginIINs, targets, counter)
 			results <- rpBalanceResult{
 				rp:          rp,
 				assignments: localAssignments,
@@ -1526,9 +1529,12 @@ func balanceGroupsParallel(ctx context.Context, groups []*iinGroup, loginKeys []
 	return assignments, nil
 }
 
-func balanceGroupsForRP(groups []*iinGroup, rpLoginKeys []loginKey, loads map[loginKey]*load, loginIINs map[loginKey]map[string]bool, targets [3]decimal.Decimal, counter *progressCounter) (map[string]loginKey, error) {
+func balanceGroupsForRP(ctx context.Context, groups []*iinGroup, rpLoginKeys []loginKey, loads map[loginKey]*load, loginIINs map[loginKey]map[string]bool, targets [3]decimal.Decimal, counter *progressCounter) (map[string]loginKey, error) {
 	assignments := make(map[string]loginKey)
 	for _, group := range groups {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		groupKey := groupAssignmentKey(group)
 		if len(rpLoginKeys) == 0 {
 			return nil, fmt.Errorf("Для РП %q нет логинов для распределения.", group.rp)
@@ -1589,7 +1595,10 @@ func balanceGroupsAcrossRP(ctx context.Context, groups []*iinGroup, loginKeys []
 	}
 
 	reportProgress(progress, 50, "Сначала рассчитываю полноценную ротацию внутри каждого РП")
-	targetRPByGroup := exchangeGroupsBetweenRP(ctx, groups, loginKeysByRP, loads, progress)
+	targetRPByGroup, err := exchangeGroupsBetweenRP(ctx, groups, loginKeysByRP, loads, progress)
+	if err != nil {
+		return nil, err
+	}
 	targetedGroups := groupsWithTargetRP(groups, targetRPByGroup)
 	reportProgress(progress, 58, "Обмен между РП подобран: сколько материалов пришло, столько же ушло")
 	assignments, err := balanceGroupsParallel(ctx, targetedGroups, loginKeys, loads, loginIINs, progress)
@@ -1600,7 +1609,7 @@ func balanceGroupsAcrossRP(ctx context.Context, groups []*iinGroup, loginKeys []
 	return assignments, nil
 }
 
-func exchangeGroupsBetweenRP(ctx context.Context, groups []*iinGroup, loginKeysByRP map[string][]loginKey, fixedLoads map[loginKey]*load, progress progressFunc) map[string]string {
+func exchangeGroupsBetweenRP(ctx context.Context, groups []*iinGroup, loginKeysByRP map[string][]loginKey, fixedLoads map[loginKey]*load, progress progressFunc) (map[string]string, error) {
 	targetRPByGroup := make(map[string]string, len(groups))
 	for _, group := range groups {
 		targetRPByGroup[groupAssignmentKey(group)] = group.rp
@@ -1611,7 +1620,7 @@ func exchangeGroupsBetweenRP(ctx context.Context, groups []*iinGroup, loginKeysB
 	lastPercent := 50
 	for swaps := 0; swaps < maxSwaps; swaps++ {
 		if err := ctx.Err(); err != nil {
-			return targetRPByGroup
+			return nil, err
 		}
 		stats := rpAverageStats(groups, targetRPByGroup, loginKeysByRP, fixedLoads)
 		highRP, lowRP, ok := widestRPAverageGap(stats)
@@ -1628,7 +1637,7 @@ func exchangeGroupsBetweenRP(ctx context.Context, groups []*iinGroup, loginKeysB
 		targetRPByGroup[lowKey] = highRP
 		lastPercent = reportRangeProgress(progress, 50, 58, swaps+1, maxSwaps, lastPercent, "Подбираю равноценный обмен материалами между РП")
 	}
-	return targetRPByGroup
+	return targetRPByGroup, nil
 }
 
 func movableGroupsByRPAndCount(groups []*iinGroup) map[string]map[int][]*iinGroup {

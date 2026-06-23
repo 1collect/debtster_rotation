@@ -27,6 +27,8 @@ import (
 
 const rotationRecordsCollection = "rotation_records"
 
+var interruptedRotationStatuses = []string{"running", "processing", "canceling"}
+
 type appIntegrations struct {
 	pg       *pgxpool.Pool
 	mongo    *mongodriver.Database
@@ -93,7 +95,7 @@ func (i *appIntegrations) cancelInterruptedRotationRecords(ctx context.Context) 
 
 	now := time.Now()
 	result, err := i.mongo.Collection(rotationRecordsCollection).UpdateMany(ctx,
-		bson.M{"status": bson.M{"$in": []string{"running", "processing"}}},
+		bson.M{"status": bson.M{"$in": interruptedRotationStatuses}},
 		bson.M{"$set": bson.M{
 			"status":       "canceled",
 			"message":      "Задача остановлена после перезапуска сервиса.",
@@ -482,6 +484,35 @@ func (s *server) updateRotationRecord(ctx context.Context, jobID string, set bso
 	}
 	set["updated_at"] = time.Now()
 	_, err := s.integrations.mongo.Collection(rotationRecordsCollection).UpdateOne(ctx, bson.M{"job_id": jobID}, bson.M{"$set": set})
+	return err
+}
+
+func (s *server) updateRotationRecordDetached(jobID string, set bson.M) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return s.updateRotationRecord(ctx, jobID, set)
+}
+
+func (s *server) cancelInterruptedRotationRecord(jobID string, message string, completedAt time.Time) error {
+	if s.integrations == nil || s.integrations.mongo == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	now := time.Now()
+	_, err := s.integrations.mongo.Collection(rotationRecordsCollection).UpdateOne(ctx,
+		bson.M{
+			"job_id": jobID,
+			"status": bson.M{"$in": interruptedRotationStatuses},
+		},
+		bson.M{"$set": bson.M{
+			"status":       "canceled",
+			"message":      message,
+			"completed_at": completedAt,
+			"updated_at":   now,
+		}},
+	)
 	return err
 }
 
