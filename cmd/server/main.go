@@ -434,7 +434,7 @@ func (s *server) startJob(content []byte, jobID, process, filename string, cfg w
 
 func (s *server) hasRunningJobLocked() bool {
 	for _, job := range s.jobs {
-		if job.state == "running" {
+		if job.state == "running" || job.state == "canceling" {
 			return true
 		}
 	}
@@ -467,8 +467,13 @@ func (s *server) runJob(ctx context.Context, content []byte, jobID, filename str
 		return
 	}
 
-	resultPath, err := s.saveRotationResult(context.Background(), jobID, filename, output)
+	resultPath, err := s.saveRotationResult(ctx, jobID, filename, output)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			log.Printf("job canceled during result save job=%s process=%s elapsed=%s", jobID, cfg.processName, time.Since(started).Round(time.Millisecond))
+			s.storeJobCanceled(jobID)
+			return
+		}
 		log.Printf("job result s3 save failed job=%s process=%s error=%v", jobID, cfg.processName, err)
 		s.storeJobError(jobID, "Не удалось сохранить результат в MinIO.")
 		return
@@ -476,6 +481,12 @@ func (s *server) runJob(ctx context.Context, content []byte, jobID, filename str
 
 	s.mu.Lock()
 	if job := s.jobs[jobID]; job != nil {
+		if job.state == "canceling" || job.state == "canceled" {
+			s.mu.Unlock()
+			log.Printf("job canceled before ready store job=%s process=%s elapsed=%s", jobID, cfg.processName, time.Since(started).Round(time.Millisecond))
+			s.storeJobCanceled(jobID)
+			return
+		}
 		job.state = "ready"
 		job.resultData = append([]byte(nil), output...)
 		job.filename = filename
@@ -559,6 +570,10 @@ func (s *server) downloadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.state == "running" {
 		writeJSONError(w, "Файл еще обрабатывается.", http.StatusConflict)
+		return
+	}
+	if result.state == "canceling" {
+		writeJSONError(w, "Задача отменяется.", http.StatusConflict)
 		return
 	}
 	if result.state == "error" {
@@ -650,8 +665,25 @@ func (s *server) cancelJob(w http.ResponseWriter, r *http.Request, jobID string)
 		return
 	}
 	cancel := job.cancel
+	job.state = "canceling"
+	job.message = "Отменяю задачу."
+	job.cancel = nil
+	job.log = append(job.log, progressRecord{At: time.Now(), Percent: job.percent, Message: job.message})
+	percent := job.percent
 	s.mu.Unlock()
 	cancel()
+	_ = s.updateRotationRecord(r.Context(), jobID, bson.M{
+		"status":   "canceling",
+		"progress": percent,
+		"message":  "Отменяю задачу.",
+	})
+	s.hub.send(jobID, payload{
+		"type":         "progress",
+		"percent":      percent,
+		"message":      "Отменяю задачу.",
+		"last_comment": "Отменяю задачу.",
+		"state":        "canceling",
+	})
 	_ = json.NewEncoder(w).Encode(map[string]string{"state": "canceling"})
 }
 
@@ -804,6 +836,10 @@ func (s *server) sendProgress(jobID string, percent int, message string) {
 	log.Printf("job progress job=%s percent=%d message=%q", jobID, percent, message)
 	s.mu.Lock()
 	if job := s.jobs[jobID]; job != nil {
+		if job.state != "running" {
+			s.mu.Unlock()
+			return
+		}
 		job.percent = percent
 		job.message = message
 		job.log = append(job.log, record)
