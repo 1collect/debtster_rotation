@@ -1055,6 +1055,11 @@ func redistributeWorkbook(ctx context.Context, input io.Reader, jobID string, ap
 	if err := replaceSummarySheet(workbook, summaryLoads, fixedCount, fixedIINCount, cfg.summaryTitle); err != nil {
 		return nil, fmt.Errorf("Не удалось сформировать лист итогов: %w", err)
 	}
+	if cfg.strategy == "cross_rp" {
+		if err := appendCrossRPExchangeSummary(workbook, sheet, cols, cfg.summaryTitle); err != nil {
+			return nil, fmt.Errorf("Не удалось сформировать итоги обмена между РП: %w", err)
+		}
+	}
 
 	var output bytes.Buffer
 	if err := workbook.Write(&output); err != nil {
@@ -2429,6 +2434,128 @@ func replaceSummarySheet(workbook *excelize.File, loads map[loginKey]*load, fixe
 		_ = workbook.SetColWidth(title, name, name, 28)
 	}
 	return nil
+}
+
+type rpExchangeStat struct {
+	rp             string
+	givenCount     int
+	receivedCount  int
+	givenAmount    decimal.Decimal
+	receivedAmount decimal.Decimal
+}
+
+func appendCrossRPExchangeSummary(workbook *excelize.File, sourceSheet string, cols columns, summarySheet string) error {
+	if cols.sourceRP == 0 {
+		return nil
+	}
+	rows, err := workbook.GetRows(sourceSheet)
+	if err != nil {
+		return err
+	}
+	stats := make(map[string]*rpExchangeStat)
+	for rowIndex := 1; rowIndex < len(rows); rowIndex++ {
+		row := rows[rowIndex]
+		if isRepeatedHeaderRow(row, cols) {
+			continue
+		}
+		sourceRP := normalizeRP(getRowCell(row, cols.sourceRP))
+		targetRP := normalizeRP(getRowCell(row, cols.rp))
+		if sourceRP == "" || targetRP == "" || sourceRP == targetRP {
+			continue
+		}
+		amount := toDecimal(getRowCell(row, cols.amount))
+		given := ensureRPExchangeStat(stats, sourceRP)
+		given.givenCount++
+		given.givenAmount = pyAdd(given.givenAmount, amount)
+		received := ensureRPExchangeStat(stats, targetRP)
+		received.receivedCount++
+		received.receivedAmount = pyAdd(received.receivedAmount, amount)
+	}
+
+	summaryRows, err := workbook.GetRows(summarySheet)
+	if err != nil {
+		return err
+	}
+	startRow := len(summaryRows) + 3
+	if err := setCell(workbook, summarySheet, startRow, 1, "Обмен между РП"); err != nil {
+		return err
+	}
+
+	headers := []any{"РП", "Отдал материалов", "Получил материалов", "Отдал сумма", "Получил сумма", "Разница материалов", "Разница суммы"}
+	for col, value := range headers {
+		if err := setCell(workbook, summarySheet, startRow+1, col+1, value); err != nil {
+			return err
+		}
+	}
+	headerStyle, _ := workbook.NewStyle(&excelize.Style{
+		Font: &excelize.Font{Bold: true},
+		Fill: excelize.Fill{Type: "pattern", Color: []string{"E7EEF8"}, Pattern: 1},
+	})
+	titleStyle, _ := workbook.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}})
+	_ = workbook.SetCellStyle(summarySheet, fmt.Sprintf("A%d", startRow), fmt.Sprintf("A%d", startRow), titleStyle)
+	_ = workbook.SetCellStyle(summarySheet, fmt.Sprintf("A%d", startRow+1), fmt.Sprintf("G%d", startRow+1), headerStyle)
+
+	keys := make([]string, 0, len(stats))
+	for rp := range stats {
+		keys = append(keys, rp)
+	}
+	sort.Strings(keys)
+	rowNumber := startRow + 2
+	for _, rp := range keys {
+		stat := stats[rp]
+		values := []any{
+			stat.rp,
+			stat.givenCount,
+			stat.receivedCount,
+			nil,
+			nil,
+			stat.receivedCount - stat.givenCount,
+			nil,
+		}
+		for col, value := range values {
+			if value == nil {
+				continue
+			}
+			if err := setCell(workbook, summarySheet, rowNumber, col+1, value); err != nil {
+				return err
+			}
+		}
+		for _, item := range []struct {
+			col    int
+			amount decimal.Decimal
+		}{
+			{col: 4, amount: stat.givenAmount},
+			{col: 5, amount: stat.receivedAmount},
+			{col: 7, amount: pySub(stat.receivedAmount, stat.givenAmount)},
+		} {
+			cell, err := excelize.CoordinatesToCellName(item.col, rowNumber)
+			if err != nil {
+				return err
+			}
+			amount, _ := item.amount.Float64()
+			if err := workbook.SetCellFloat(summarySheet, cell, amount, -1, 64); err != nil {
+				return err
+			}
+		}
+		rowNumber++
+	}
+	if rowNumber > startRow+2 {
+		amountStyle, _ := workbook.NewStyle(&excelize.Style{NumFmt: 4})
+		_ = workbook.SetCellStyle(summarySheet, fmt.Sprintf("D%d", startRow+2), fmt.Sprintf("E%d", rowNumber-1), amountStyle)
+		_ = workbook.SetCellStyle(summarySheet, fmt.Sprintf("G%d", startRow+2), fmt.Sprintf("G%d", rowNumber-1), amountStyle)
+	}
+	for col := 1; col <= 7; col++ {
+		name, _ := excelize.ColumnNumberToName(col)
+		_ = workbook.SetColWidth(summarySheet, name, name, 28)
+	}
+	return nil
+}
+
+func ensureRPExchangeStat(stats map[string]*rpExchangeStat, rp string) *rpExchangeStat {
+	if stats[rp] == nil {
+		stats[rp] = &rpExchangeStat{rp: rp}
+	}
+	return stats[rp]
 }
 
 func styleAttachColumn(workbook *excelize.File, sheet string, column int) error {

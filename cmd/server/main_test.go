@@ -179,6 +179,36 @@ func TestCrossRPRotationWritesSourceRPAndExchangesEqualMaterialCount(t *testing.
 	if smallRowRP != "РП_A" || smallRowSourceRP != "РП_B" || smallRowLogin != "LOGIN_A" {
 		t.Fatalf("small row = rp/source/login %q/%q/%q, want РП_A/РП_B/LOGIN_A", smallRowRP, smallRowSourceRP, smallRowLogin)
 	}
+
+	summaryRows, err := result.GetRows("Итоги ротации между РП")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchangeRow := -1
+	for index, row := range summaryRows {
+		if getRowCell(row, 1) == "Обмен между РП" {
+			exchangeRow = index + 1
+			break
+		}
+	}
+	if exchangeRow == -1 {
+		t.Fatal("missing Обмен между РП summary block")
+	}
+	for _, tc := range []struct {
+		rp       string
+		rowIndex int
+	}{
+		{rp: "РП_A", rowIndex: exchangeRow + 2},
+		{rp: "РП_B", rowIndex: exchangeRow + 3},
+	} {
+		row := summaryRows[tc.rowIndex-1]
+		if normalizeRP(getRowCell(row, 1)) != tc.rp {
+			t.Fatalf("exchange row %d rp = %q, want %q", tc.rowIndex, getRowCell(row, 1), tc.rp)
+		}
+		if getRowCell(row, 2) != "1" || getRowCell(row, 3) != "1" || getRowCell(row, 6) != "0" {
+			t.Fatalf("exchange row %s given/received/diff = %q/%q/%q, want 1/1/0", tc.rp, getRowCell(row, 2), getRowCell(row, 3), getRowCell(row, 6))
+		}
+	}
 }
 
 func TestReplaceSummarySheetWritesAmountWithoutFixedDecimalPlaces(t *testing.T) {
