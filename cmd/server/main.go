@@ -57,6 +57,7 @@ var alignmentScoreWeights = scoreWeights{
 	materialCount: decimal.Zero,
 	iinCount:      decimal.NewFromInt(1),
 }
+var crossRPMaxAmountDifference = decimal.NewFromInt(1_000_000)
 
 func init() {
 	decimal.DivisionPrecision = 80
@@ -1594,13 +1595,13 @@ func balanceGroupsAcrossRP(ctx context.Context, groups []*iinGroup, loginKeys []
 		}
 	}
 
-	reportProgress(progress, 50, "Сначала рассчитываю полноценную ротацию внутри каждого РП")
-	targetRPByGroup, err := exchangeGroupsBetweenRP(ctx, groups, loginKeysByRP, loads, progress)
+	reportProgress(progress, 50, "Подбираю равноценный обмен материалами между РП")
+	targetRPByGroup, err := exchangeGroupsBetweenRP(ctx, groups, progress)
 	if err != nil {
 		return nil, err
 	}
 	targetedGroups := groupsWithTargetRP(groups, targetRPByGroup)
-	reportProgress(progress, 58, "Обмен между РП подобран: сколько материалов пришло, столько же ушло")
+	reportProgress(progress, 58, "Обмен между РП подобран: количество материалов сходится, разница суммы до 1 млн")
 	assignments, err := balanceGroupsParallel(ctx, targetedGroups, loginKeys, loads, loginIINs, progress)
 	if err != nil {
 		return nil, err
@@ -1609,148 +1610,118 @@ func balanceGroupsAcrossRP(ctx context.Context, groups []*iinGroup, loginKeys []
 	return assignments, nil
 }
 
-func exchangeGroupsBetweenRP(ctx context.Context, groups []*iinGroup, loginKeysByRP map[string][]loginKey, fixedLoads map[loginKey]*load, progress progressFunc) (map[string]string, error) {
+func exchangeGroupsBetweenRP(ctx context.Context, groups []*iinGroup, progress progressFunc) (map[string]string, error) {
 	targetRPByGroup := make(map[string]string, len(groups))
 	for _, group := range groups {
 		targetRPByGroup[groupAssignmentKey(group)] = group.rp
 	}
 
-	movableByRPAndCount := movableGroupsByRPAndCount(groups)
-	maxSwaps := len(groups)
+	movableByCount := movableGroupsByCount(groups)
+	exchangeAmountBalanceByRP := make(map[string]decimal.Decimal)
+	totalMovable := 0
+	for _, groupsWithCount := range movableByCount {
+		totalMovable += len(groupsWithCount)
+	}
+	counts := make([]int, 0, len(movableByCount))
+	for count := range movableByCount {
+		counts = append(counts, count)
+	}
+	sort.Ints(counts)
 	lastPercent := 50
-	for swaps := 0; swaps < maxSwaps; swaps++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	processed := 0
+	for _, count := range counts {
+		groupsWithCount := movableByCount[count]
+		for _, group := range groupsWithCount {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			processed++
+			if !groupAvailableForExchange(group, targetRPByGroup) {
+				continue
+			}
+			partner, ok := bestExchangePartner(groupsWithCount, targetRPByGroup, exchangeAmountBalanceByRP, group, crossRPMaxAmountDifference)
+			if !ok {
+				continue
+			}
+			groupKey := groupAssignmentKey(group)
+			partnerKey := groupAssignmentKey(partner)
+			targetRPByGroup[groupKey] = partner.rp
+			targetRPByGroup[partnerKey] = group.rp
+			applyExchangeAmountBalance(exchangeAmountBalanceByRP, group, partner)
+			lastPercent = reportRangeProgress(progress, 50, 58, processed, totalMovable, lastPercent, "Подбираю равноценный обмен материалами между РП")
 		}
-		stats := rpAverageStats(groups, targetRPByGroup, loginKeysByRP, fixedLoads)
-		highRP, lowRP, ok := widestRPAverageGap(stats)
-		if !ok {
-			break
-		}
-		highGroup, lowGroup, ok := bestBalancedExchange(movableByRPAndCount, targetRPByGroup, highRP, lowRP)
-		if !ok {
-			break
-		}
-		highKey := groupAssignmentKey(highGroup)
-		lowKey := groupAssignmentKey(lowGroup)
-		targetRPByGroup[highKey] = lowRP
-		targetRPByGroup[lowKey] = highRP
-		lastPercent = reportRangeProgress(progress, 50, 58, swaps+1, maxSwaps, lastPercent, "Подбираю равноценный обмен материалами между РП")
 	}
 	return targetRPByGroup, nil
 }
 
-func movableGroupsByRPAndCount(groups []*iinGroup) map[string]map[int][]*iinGroup {
-	out := make(map[string]map[int][]*iinGroup)
+func movableGroupsByCount(groups []*iinGroup) map[int][]*iinGroup {
+	out := make(map[int][]*iinGroup)
 	for _, group := range groups {
 		if group.pinnedLogin != "" {
 			continue
 		}
-		if out[group.rp] == nil {
-			out[group.rp] = make(map[int][]*iinGroup)
-		}
-		out[group.rp][len(group.rows)] = append(out[group.rp][len(group.rows)], group)
+		out[len(group.rows)] = append(out[len(group.rows)], group)
 	}
-	for rp, byCount := range out {
-		for count := range byCount {
-			sort.SliceStable(byCount[count], func(i, j int) bool {
-				return byCount[count][i].amount.GreaterThan(byCount[count][j].amount)
-			})
-		}
-		out[rp] = byCount
+	for count, groupsWithCount := range out {
+		sort.SliceStable(groupsWithCount, func(i, j int) bool {
+			if groupsWithCount[i].amount.Equal(groupsWithCount[j].amount) {
+				if groupsWithCount[i].rp == groupsWithCount[j].rp {
+					return groupsWithCount[i].iin < groupsWithCount[j].iin
+				}
+				return groupsWithCount[i].rp < groupsWithCount[j].rp
+			}
+			return groupsWithCount[i].amount.LessThan(groupsWithCount[j].amount)
+		})
+		out[count] = groupsWithCount
 	}
 	return out
 }
 
-type rpAverageStat struct {
-	rp     string
-	amount decimal.Decimal
-	logins int
-	avg    decimal.Decimal
-}
-
-func rpAverageStats(groups []*iinGroup, targetRPByGroup map[string]string, loginKeysByRP map[string][]loginKey, fixedLoads map[loginKey]*load) map[string]rpAverageStat {
-	stats := make(map[string]rpAverageStat)
-	for rp, logins := range loginKeysByRP {
-		stat := stats[rp]
-		stat.rp = rp
-		stat.logins = len(logins)
-		for _, login := range logins {
-			if fixedLoads[login] != nil {
-				stat.amount = pyAdd(stat.amount, fixedLoads[login].amount)
-			}
-		}
-		stats[rp] = stat
-	}
-	for _, group := range groups {
-		targetRP := targetRPByGroup[groupAssignmentKey(group)]
-		stat := stats[targetRP]
-		stat.rp = targetRP
-		stat.amount = pyAdd(stat.amount, group.amount)
-		stats[targetRP] = stat
-	}
-	for rp, stat := range stats {
-		if stat.logins > 0 {
-			stat.avg = pyDiv(stat.amount, decimal.NewFromInt(int64(stat.logins)))
-		}
-		stats[rp] = stat
-	}
-	return stats
-}
-
-func widestRPAverageGap(stats map[string]rpAverageStat) (string, string, bool) {
-	var high rpAverageStat
-	var low rpAverageStat
-	hasHigh := false
-	hasLow := false
-	for _, stat := range stats {
-		if stat.logins == 0 {
+func bestExchangePartner(candidates []*iinGroup, targetRPByGroup map[string]string, balanceByRP map[string]decimal.Decimal, group *iinGroup, maxAmountDifference decimal.Decimal) (*iinGroup, bool) {
+	var best *iinGroup
+	bestDifference := decimal.Zero
+	for _, candidate := range candidates {
+		if candidate == group || candidate.rp == group.rp || !groupAvailableForExchange(candidate, targetRPByGroup) {
 			continue
 		}
-		if !hasHigh || stat.avg.GreaterThan(high.avg) {
-			high = stat
-			hasHigh = true
+		if !exchangeAmountBalanceWithinLimit(balanceByRP, group, candidate, maxAmountDifference) {
+			continue
 		}
-		if !hasLow || stat.avg.LessThan(low.avg) {
-			low = stat
-			hasLow = true
+		difference := decimalAbs(pySub(group.amount, candidate.amount))
+		if best == nil || difference.LessThan(bestDifference) {
+			best = candidate
+			bestDifference = difference
 		}
 	}
-	if !hasHigh || !hasLow || high.rp == low.rp || high.avg.LessThanOrEqual(low.avg) {
-		return "", "", false
-	}
-	return high.rp, low.rp, true
+	return best, best != nil
 }
 
-func bestBalancedExchange(groupsByRPAndCount map[string]map[int][]*iinGroup, targetRPByGroup map[string]string, highRP, lowRP string) (*iinGroup, *iinGroup, bool) {
-	var bestHigh *iinGroup
-	var bestLow *iinGroup
-	bestImprovement := decimal.Zero
-	for count, highGroups := range groupsByRPAndCount[highRP] {
-		lowGroups := groupsByRPAndCount[lowRP][count]
-		for _, highGroup := range highGroups {
-			if targetRPByGroup[groupAssignmentKey(highGroup)] != highRP {
-				continue
-			}
-			for lowIndex := len(lowGroups) - 1; lowIndex >= 0; lowIndex-- {
-				lowGroup := lowGroups[lowIndex]
-				if targetRPByGroup[groupAssignmentKey(lowGroup)] != lowRP {
-					continue
-				}
-				improvement := pySub(highGroup.amount, lowGroup.amount)
-				if improvement.GreaterThan(bestImprovement) {
-					bestImprovement = improvement
-					bestHigh = highGroup
-					bestLow = lowGroup
-				}
-				break
-			}
-		}
+func groupAvailableForExchange(group *iinGroup, targetRPByGroup map[string]string) bool {
+	return targetRPByGroup[groupAssignmentKey(group)] == group.rp
+}
+
+func exchangeAmountBalanceWithinLimit(balanceByRP map[string]decimal.Decimal, left *iinGroup, right *iinGroup, maxDifference decimal.Decimal) bool {
+	leftBalance, rightBalance := exchangeAmountBalancesAfterSwap(balanceByRP, left, right)
+	return decimalAbs(leftBalance).LessThanOrEqual(maxDifference) && decimalAbs(rightBalance).LessThanOrEqual(maxDifference)
+}
+
+func applyExchangeAmountBalance(balanceByRP map[string]decimal.Decimal, left *iinGroup, right *iinGroup) {
+	leftBalance, rightBalance := exchangeAmountBalancesAfterSwap(balanceByRP, left, right)
+	balanceByRP[left.rp] = leftBalance
+	balanceByRP[right.rp] = rightBalance
+}
+
+func exchangeAmountBalancesAfterSwap(balanceByRP map[string]decimal.Decimal, left *iinGroup, right *iinGroup) (decimal.Decimal, decimal.Decimal) {
+	leftBalance := pyAdd(balanceByRP[left.rp], pySub(right.amount, left.amount))
+	rightBalance := pyAdd(balanceByRP[right.rp], pySub(left.amount, right.amount))
+	return leftBalance, rightBalance
+}
+
+func decimalAbs(value decimal.Decimal) decimal.Decimal {
+	if value.LessThan(decimal.Zero) {
+		return pySub(decimal.Zero, value)
 	}
-	if bestHigh == nil || bestLow == nil || !bestImprovement.GreaterThan(decimal.Zero) {
-		return nil, nil, false
-	}
-	return bestHigh, bestLow, true
+	return value
 }
 
 func groupsWithTargetRP(groups []*iinGroup, targetRPByGroup map[string]string) []*iinGroup {

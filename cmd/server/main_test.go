@@ -211,6 +211,67 @@ func TestCrossRPRotationWritesSourceRPAndExchangesEqualMaterialCount(t *testing.
 	}
 }
 
+func TestCrossRPExchangeSkipsPairAboveAmountTolerance(t *testing.T) {
+	groups := []*iinGroup{
+		{rp: "РП_A", iin: "111", rows: []int{2}, amount: decimal.NewFromInt(2_500_000)},
+		{rp: "РП_B", iin: "222", rows: []int{3}, amount: decimal.NewFromInt(1_000_000)},
+	}
+
+	targetRPByGroup, err := exchangeGroupsBetweenRP(context.Background(), groups, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, group := range groups {
+		if got := targetRPByGroup[groupAssignmentKey(group)]; got != group.rp {
+			t.Fatalf("target rp for %s = %q, want original %q", group.iin, got, group.rp)
+		}
+	}
+}
+
+func TestCrossRPExchangeKeepsCumulativeAmountDifferenceWithinTolerance(t *testing.T) {
+	groups := []*iinGroup{
+		{rp: "РП_A", iin: "111", rows: []int{2}, amount: decimal.NewFromInt(5_000_000)},
+		{rp: "РП_A", iin: "112", rows: []int{3}, amount: decimal.NewFromInt(4_900_000)},
+		{rp: "РП_B", iin: "221", rows: []int{4}, amount: decimal.NewFromInt(4_100_000)},
+		{rp: "РП_B", iin: "222", rows: []int{5}, amount: decimal.NewFromInt(4_000_000)},
+	}
+
+	targetRPByGroup, err := exchangeGroupsBetweenRP(context.Background(), groups, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	moved := 0
+	for _, group := range groups {
+		if targetRPByGroup[groupAssignmentKey(group)] != group.rp {
+			moved++
+		}
+	}
+	if moved != 2 {
+		t.Fatalf("moved groups = %d, want 2", moved)
+	}
+
+	for rp, balance := range crossRPAmountBalances(groups, targetRPByGroup) {
+		if decimalAbs(balance).GreaterThan(crossRPMaxAmountDifference) {
+			t.Fatalf("amount balance for %s = %s, want within %s", rp, balance.String(), crossRPMaxAmountDifference.String())
+		}
+	}
+}
+
+func crossRPAmountBalances(groups []*iinGroup, targetRPByGroup map[string]string) map[string]decimal.Decimal {
+	balances := make(map[string]decimal.Decimal)
+	for _, group := range groups {
+		targetRP := targetRPByGroup[groupAssignmentKey(group)]
+		if targetRP == "" || targetRP == group.rp {
+			continue
+		}
+		balances[group.rp] = pySub(balances[group.rp], group.amount)
+		balances[targetRP] = pyAdd(balances[targetRP], group.amount)
+	}
+	return balances
+}
+
 func TestReplaceSummarySheetWritesAmountWithoutFixedDecimalPlaces(t *testing.T) {
 	workbook := excelize.NewFile()
 	amount := decimal.RequireFromString("1234.56")
